@@ -13,9 +13,15 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
+ECEFConverter = Mapping[str, Callable[[Tuple[float, float, float]], Tuple[float, float, float]]]
+
 
 def round_half_away_from_zero(value: float) -> int:
-    """Round-half-away-from-zero with no reliance on language defaults."""
+    """Round-half-away-from-zero with no reliance on language defaults.
+
+    Examples:
+        1.5 -> 2, -1.5 -> -2, 1.2 -> 1, -1.2 -> -1
+    """
     if value == 0:
         return 0
     sign = 1 if value > 0 else -1
@@ -54,7 +60,7 @@ class DatasetConfig:
 def convert_to_ecef(
     coordinates_m: Tuple[float, float, float],
     earth_model_id: str,
-    converter: Optional[Mapping[str, Callable[[Tuple[float, float, float]], Tuple[float, float, float]]]] = None,
+    converter: Optional[ECEFConverter] = None,
 ) -> Tuple[float, float, float]:
     """Convert to ECEF using declared earth_model_id.
 
@@ -70,6 +76,12 @@ def convert_to_ecef(
 def quantize_space_ecef(
     coordinates_ecef_m: Tuple[float, float, float], Q_space_m: float
 ) -> Tuple[int, int, int]:
+    if len(coordinates_ecef_m) != 3:
+        raise ValueError(
+            f"coordinates_ecef_m must be a 3-element tuple, got {len(coordinates_ecef_m)} elements"
+        )
+    if Q_space_m == 0:
+        raise ValueError("Q_space_m must be non-zero for quantization")
     x_m, y_m, z_m = coordinates_ecef_m
     return (
         round_half_away_from_zero(x_m / Q_space_m),
@@ -79,6 +91,8 @@ def quantize_space_ecef(
 
 
 def quantize_time(time_value: float, Q_time: float) -> int:
+    if Q_time == 0:
+        raise ValueError("Q_time must be non-zero for quantization")
     return round_half_away_from_zero(time_value / Q_time)
 
 
@@ -130,11 +144,15 @@ def _hash_bytes(parts: Iterable[bytes]) -> str:
 
 def _encode_block(records: Iterable[bytes]) -> bytes:
     """Encode a block with bytewise lexicographic sorting and deduplication."""
-    unique_sorted = sorted(set(records))
+    sorted_records = sorted(records)
     output = bytearray()
-    for rec in unique_sorted:
+    last: Optional[bytes] = None
+    for rec in sorted_records:
+        if rec == last:
+            continue
         output.extend(len(rec).to_bytes(4, "big"))
         output.extend(rec)
+        last = rec
     return bytes(output)
 
 
@@ -169,7 +187,14 @@ def build_s1_canonical_bytes(
     relation_block = _encode_block(rel.encode("utf-8") for rel in relations)
     constraint_block = _encode_block(con.encode("utf-8") for con in constraints)
     return b"".join(
-        [header, vocab_block, operator_block, entity_block, relation_block, constraint_block]
+        (
+            header,
+            vocab_block,
+            operator_block,
+            entity_block,
+            relation_block,
+            constraint_block,
+        )
     )
 
 
@@ -220,12 +245,12 @@ def build_semantic_signature(
     for ent in semantic_input.entities:
         ent_type = ent.get("type")
         ent_id = ent.get("id")
+        encoded_entity = _encode_entity(ent)
         if ent_type in {"STABLE", "DERIVED"} and ent_id:
-            encoded = _encode_entity(ent)
-            pure_entities.append(encoded)
+            pure_entities.append(encoded_entity)
         else:
-            unknown_entities.add(_encode_entity(ent))
-            unknown_components.append(f"entity:{_encode_entity(ent)}")
+            unknown_entities.add(encoded_entity)
+            unknown_components.append(f"entity:{encoded_entity}")
 
     pure_relations: List[str] = []
     for rel in semantic_input.relations:
@@ -340,7 +365,7 @@ class SigilWriter:
     def __init__(self, pure_path: Optional[str], unknown_path: Optional[str]) -> None:
         if not pure_path or not unknown_path:
             raise ValueError(
-                "TODO: configurable sigil output paths must be provided (sigils_pure.<ext>, sigils_unknown.<ext>)"
+                "Both pure_path and unknown_path must be provided for sigil output"
             )
         self.pure_path = pure_path
         self.unknown_path = unknown_path
@@ -377,7 +402,7 @@ class SigilWriter:
 
     @staticmethod
     def _write_json_lines(path: str, records: Sequence[Mapping[str, object]]) -> None:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "a", encoding="utf-8") as f:
             for rec in records:
                 f.write(json.dumps(rec, sort_keys=True, separators=(",", ":")))
                 f.write("\n")
@@ -386,7 +411,7 @@ class SigilWriter:
 class Guardian:
     """Guardian enforcement for voxel creation and mutation."""
 
-    FORBIDDEN_PAYLOAD_KEYS = {"pixels", "frames", "meshes", "textures", "camera", "style", "appearance"}
+    FORBIDDEN_PAYLOAD_KEYS = frozenset({"pixels", "frames", "meshes", "textures", "camera", "style", "appearance"})
 
     def assert_creation_allowed(
         self, payload: Mapping[str, object], operators: Sequence[str], vocab_manifest: VocabManifest
@@ -423,7 +448,18 @@ class NestBindingAdapter:
         self._nest_to_voxels: Dict[str, Set[str]] = {}
         self._cluster_descriptors: Dict[str, Mapping[str, object]] = {}
 
-    def bind(self, nest_id: str, voxel_ids: Sequence[str], cluster_descriptor: Optional[Mapping[str, object]] = None) -> None:
+    def bind(
+        self,
+        nest_id: str,
+        voxel_ids: Sequence[str],
+        cluster_descriptor: Optional[Mapping[str, object]] = None,
+    ) -> None:
+        if not nest_id:
+            raise ValueError("nest_id is required for binding")
+        if not voxel_ids:
+            raise ValueError("voxel_ids must not be empty")
+        if any(vid == "" for vid in voxel_ids):
+            raise ValueError("voxel_ids must contain non-empty identifiers")
         self._nest_to_voxels.setdefault(nest_id, set()).update(voxel_ids)
         if cluster_descriptor:
             descriptor_key = self._descriptor_key(cluster_descriptor)

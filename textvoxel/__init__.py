@@ -14,4 +14,5 @@ from .binding import (  # noqa: F401
     build_s1_canonical_bytes,
     compute_voxel_identity,
     round_half_away_from_zero,
+    NestBindingAdapter,
 )
